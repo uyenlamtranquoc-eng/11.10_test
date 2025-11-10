@@ -1,7 +1,7 @@
 <configuration>
     <input>
         <net-file value="grid1x3.net.xml"/>
-        <route-files value="grid1x3_weighted_mt.rou.pen30.xml"/>
+        <route-files value="grid1x3_structured.rou.xml"/>
     </input>
     <time>
         <begin value="0"/>

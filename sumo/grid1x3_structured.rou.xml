@@ -1,0 +1,41 @@
+<?xml version='1.0' encoding='utf-8'?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="human" accel="2.6" decel="4.5" sigma="0.5" length="5.0" minGap="2.5" speedDev="0.1" />
+    <vType id="cav" accel="3.0" decel="5.0" sigma="0.1" length="4.5" minGap="1.0" speedDev="0.05" />
+    <!--Mainline straight-through traffic (controlled lane)-->
+    <route id="route_west_straight" edges="W_J0 J0_J1 J1_J2 J2_E" />
+    <flow id="flow_west_straight_human" type="human" route="route_west_straight" begin="0" end="3600" departLane="1" departSpeed="max" departPos="base" vehsPerHour="900.00" probability="0.250000" />
+    <!--Westbound to south right-turn movements-->
+    <route id="route_west_right" edges="W_J0 J0_S0" />
+    <flow id="flow_west_right_human" type="human" route="route_west_right" begin="0" end="3600" departLane="0" departSpeed="max" departPos="base" vehsPerHour="180.00" probability="0.050000" />
+    <!--Westbound to north left-turn movements-->
+    <route id="route_west_left" edges="W_J0 J0_N0" />
+    <flow id="flow_west_left_human" type="human" route="route_west_left" begin="0" end="3600" departLane="2" departSpeed="max" departPos="base" vehsPerHour="180.00" probability="0.050000" />
+    <!--Eastbound straight-through traffic (controlled lane)-->
+    <route id="route_east_straight" edges="E_J2 J2_J1 J1_J0 J0_W" />
+    <flow id="flow_east_straight_human" type="human" route="route_east_straight" begin="0" end="3600" departLane="1" departSpeed="max" departPos="base" vehsPerHour="900.00" probability="0.250000" />
+    <!--Eastbound to north right-turn movements-->
+    <route id="route_east_right" edges="E_J2 J2_N2" />
+    <flow id="flow_east_right_human" type="human" route="route_east_right" begin="0" end="3600" departLane="0" departSpeed="max" departPos="base" vehsPerHour="180.00" probability="0.050000" />
+    <!--Eastbound to south left-turn movements-->
+    <route id="route_east_left" edges="E_J2 J2_S2" />
+    <flow id="flow_east_left_human" type="human" route="route_east_left" begin="0" end="3600" departLane="2" departSpeed="max" departPos="base" vehsPerHour="180.00" probability="0.050000" />
+    <!--South leg at J0 heading north-->
+    <route id="route_south0_northbound" edges="S0_J0 J0_J1 J1_N1" />
+    <flow id="flow_south0_northbound_human" type="human" route="route_south0_northbound" begin="0" end="3600" departLane="0" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+    <!--South leg at J1 heading north-->
+    <route id="route_south1_northbound" edges="S1_J1 J1_J2 J2_N2" />
+    <flow id="flow_south1_northbound_human" type="human" route="route_south1_northbound" begin="0" end="3600" departLane="0" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+    <!--South leg at J2 heading north-west-->
+    <route id="route_south2_straight" edges="S2_J2 J2_J1 J1_J0" />
+    <flow id="flow_south2_straight_human" type="human" route="route_south2_straight" begin="0" end="3600" departLane="0" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+    <!--North leg at J0 heading south-east-->
+    <route id="route_north0_southbound" edges="N0_J0 J0_J1 J1_S1" />
+    <flow id="flow_north0_southbound_human" type="human" route="route_north0_southbound" begin="0" end="3600" departLane="1" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+    <!--North leg at J1 heading south-west-->
+    <route id="route_north1_southbound" edges="N1_J1 J1_J0 J0_S0" />
+    <flow id="flow_north1_southbound_human" type="human" route="route_north1_southbound" begin="0" end="3600" departLane="1" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+    <!--North leg at J2 heading south-west-->
+    <route id="route_north2_straight" edges="N2_J2 J2_J1 J1_J0" />
+    <flow id="flow_north2_straight_human" type="human" route="route_north2_straight" begin="0" end="3600" departLane="1" departSpeed="max" departPos="base" vehsPerHour="240.00" probability="0.066667" />
+</routes>
