@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edgedata>
+    <interval begin="0" end="3600">
+        <!-- 主路边缘（西、东）入口权重较高 -->
+        <edge id="W_J0" value="70"/>
+        <edge id="E_J2" value="70"/>
+
+        <!-- 支路（北、南）入口权重较低 -->
+        <edge id="N0_J0" value="10"/>
+        <edge id="S0_J0" value="10"/>
+        <edge id="N1_J1" value="10"/>
+        <edge id="S1_J1" value="10"/>
+        <edge id="N2_J2" value="10"/>
+        <edge id="S2_J2" value="10"/>
+    </interval>
+</edgedata>

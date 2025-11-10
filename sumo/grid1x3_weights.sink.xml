@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<edgedata>
+    <interval begin="0" end="3600">
+        <!-- 将目的地限制在路网边界，提升可路由率 -->
+        <edge id="J0_W" value="20"/>
+        <edge id="J2_E" value="20"/>
+        <edge id="J0_N0" value="20"/>
+        <edge id="J1_N1" value="20"/>
+        <edge id="J2_N2" value="20"/>
+        <edge id="J0_S0" value="20"/>
+        <edge id="J1_S1" value="20"/>
+        <edge id="J2_S2" value="20"/>
+    </interval>
+</edgedata>
