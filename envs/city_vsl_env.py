@@ -115,14 +115,15 @@ class CityVSLEnv(gym.Env):
         n_per_segment = len(self.speed_levels_mps) if self.speed_levels_mps else 1
         self.action_space = spaces.MultiDiscrete(np.array([n_per_segment] * 6, dtype=np.int64))
 
-        # 观测空间（增强版 + 双趋势 + 全局CAV）：
+        # 观测空间（增强版 + 双趋势 + 全局CAV + 方向化变幅因子）：
         # 东向3段 + 西向3段：每段 occ + speed + halts_norm = 3 * 6 = 18
         # 每信号: phase_norm + remain_norm + next_green_start_norm + next_green_duration_norm = 4 * 3 = 12
         # 需求趋势（60s滑动）= 1；慢趋势（5min滑动）= 1
         # 全局 CAV 占比（episode 级 sanity check）= 1
         # 每段 CAV 占比 = 6
         # 每段速度波动（与上一步的差值，归一化）= 6
-        self.obs_dim = (3 * len(self.group_keys) * 2) + (4 * len(self.tls_ids)) + 2 + 1 + (len(self.group_keys) * 2) + (len(self.group_keys) * 2)
+        # 方向化变幅因子（红绿切换导致的临时收紧/放宽）= 2（EB/WB）
+        self.obs_dim = (3 * len(self.group_keys) * 2) + (4 * len(self.tls_ids)) + 2 + 1 + (len(self.group_keys) * 2) + (len(self.group_keys) * 2) + 2
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32
         )
@@ -164,17 +165,28 @@ class CityVSLEnv(gym.Env):
         self._prev_tls_green_state: Dict[str, bool] = {tid: False for tid in (self.tls_ids or [])}
         self._prev_segment_speeds_norm: Dict[str, Dict[str, float]] = {"eb": {}, "wb": {}}
         self._prev_meas_segment_speeds_norm: Dict[str, Dict[str, float]] = {"eb": {}, "wb": {}}
+        # 最近一次耦合变幅因子（方向/分段），用于观测提示策略当步能实现的最大变幅
+        self.last_local_factor: Dict[str, Dict[str, float]] = {
+            "eb": {k: 1.0 for k in self.group_keys},
+            "wb": {k: 1.0 for k in self.group_keys},
+        }
         self._fuel_hist: deque = deque(maxlen=int(max(3, round(600.0 / float(max(self.decision_interval, 1))))))
-        # 需求趋势：最近数步到达流率（veh/s）的滑动窗口（快与慢两个时间尺度）
-        self._trend_window_steps: int = int(max(3, round(60.0 / float(max(self.decision_interval, 1)))))
+        # 提前初始化归一策略配置，避免在首次使用前引用为空
+        self.norm_cfg = norm_cfg or {}
+        # 需求趋势：最近数步到达流率（veh/s）的滑动窗口（快与慢两个时间尺度，可配置）
+        _trend_fast_sec = float(self.norm_cfg.get("arrival_trend_window_seconds_fast", 60.0))
+        _trend_slow_sec = float(self.norm_cfg.get("arrival_trend_window_seconds_slow", 300.0))
+        self._trend_window_steps: int = int(max(3, round(_trend_fast_sec / float(max(self.decision_interval, 1)))))
         self._arrival_rate_hist: deque = deque(maxlen=self._trend_window_steps)
         # 方向化到达率窗口（EB/WB）：与全局窗口同长度
         self._arrival_rate_hist_eb: deque = deque(maxlen=self._trend_window_steps)
         self._arrival_rate_hist_wb: deque = deque(maxlen=self._trend_window_steps)
-        self._trend_window_steps_slow: int = int(max(3, round(300.0 / float(max(self.decision_interval, 1)))))  # 5分钟窗口
+        self._trend_window_steps_slow: int = int(max(3, round(_trend_slow_sec / float(max(self.decision_interval, 1)))))  # 慢趋势窗口
         self._arrival_rate_hist_slow: deque = deque(maxlen=self._trend_window_steps_slow)
         self._arrival_rate_hist_slow_eb: deque = deque(maxlen=self._trend_window_steps_slow)
         self._arrival_rate_hist_slow_wb: deque = deque(maxlen=self._trend_window_steps_slow)
+        # 实时兜底权重：将瞬时到达率混入趋势归一，降低窗口滞后
+        self._trend_inst_fallback_w: float = float(self.norm_cfg.get("trend_inst_fallback_weight", 0.0))
         # 归一化参考通行能力（veh/h）：按下游段车道数估计
         down_lanes = len(self.lane_groups.get("down", [])) + len(self.wb_lane_groups.get("down", []))
         down_lanes = int(max(down_lanes, 1))
@@ -220,7 +232,6 @@ class CityVSLEnv(gym.Env):
         self._corridor_exit_seen_wb: set = set()
 
         # —— 归一策略（场景适配）——
-        self.norm_cfg = norm_cfg or {}
         # halts 归一上限策略
         self.halts_upper_strategy: str = str(self.norm_cfg.get("halts_upper_strategy", "by_lane_length_and_p95")).lower()
         self.halts_fixed_upper: float = float(self.norm_cfg.get("halts_fixed_upper", 5.0))
@@ -608,6 +619,12 @@ class CityVSLEnv(gym.Env):
                 pass
             lm = self._step_cache.get("lane_metrics", {"eb": {}, "wb": {}})
 
+        # 初始化本步的信号窗口标志缓存
+        try:
+            signal_flags = self._step_cache.setdefault("signal_window_flags", {"eb": {}, "wb": {}})
+        except Exception:
+            signal_flags = {"eb": {}, "wb": {}}
+
         prev = np.array(self._last_action_speeds, dtype=float)
         ts = np.array(list(target_speeds), dtype=float)
         orig_ts = np.array(list(target_speeds), dtype=float)
@@ -648,6 +665,19 @@ class CityVSLEnv(gym.Env):
                 start_sec = float(start_norm) * cycle_len
                 dur_sec = float(dur_norm) * cycle_len
 
+                # 记录信号窗口标志（is_green_now/near_green/start_sec/dur_sec/remain_curr）
+                try:
+                    near_green = bool(start_sec <= (2.0 * float(self.decision_interval)))
+                    signal_flags.setdefault(direction, {})[seg] = {
+                        "is_green_now": bool(is_now_green),
+                        "near_green": bool(near_green),
+                        "start_sec": float(start_sec),
+                        "dur_sec": float(dur_sec),
+                        "remain_curr": float(remain_curr),
+                    }
+                except Exception:
+                    pass
+
                 # 段拥挤与溢出
                 vals = lm.get(direction, {}).get(seg, {})
                 avg_halts = float(vals.get("halts", 0.0))
@@ -687,6 +717,13 @@ class CityVSLEnv(gym.Env):
                             self.metrics["coupling_clamp_events"] = int(self.metrics.get("coupling_clamp_events", 0) or 0) + 1
                     except Exception:
                         pass
+                # 面向诊断的拥挤/占有率附加标志
+                try:
+                    sf = signal_flags.setdefault(direction, {}).setdefault(seg, {})
+                    sf["halts_norm"] = float(halts_norm)
+                    sf["occ"] = float(occ)
+                except Exception:
+                    pass
 
                 # 绿窗不足则平滑下降：避免中段突然停车
                 def _seg_len_avg(direction: str, segment: str) -> float:
@@ -733,6 +770,11 @@ class CityVSLEnv(gym.Env):
                 try:
                     self.metrics["local_factor_sum"] = float(self.metrics.get("local_factor_sum", 0.0) or 0.0) + float(local_factor)
                     self.metrics["local_factor_steps"] = int(self.metrics.get("local_factor_steps", 0) or 0) + 1
+                except Exception:
+                    pass
+                # 记录最近一次方向/分段的局部因子以供观测
+                try:
+                    self.last_local_factor.setdefault(direction, {})[seg] = float(local_factor)
                 except Exception:
                     pass
                 self._prev_tls_green_state[tls_id] = bool(is_now_green == 1.0)
@@ -979,6 +1021,20 @@ class CityVSLEnv(gym.Env):
             "coupling_clamp_events": 0,
             "local_factor_sum": 0.0,
             "local_factor_steps": 0,
+            # 奖励分量累计（用于episode均值）
+            "reward_component_steps": 0,
+            "r_efficiency_sum": 0.0,
+            "r_throughput_sum": 0.0,
+            "r_coordination_sum": 0.0,
+            "r_congestion_sum": 0.0,
+            "r_delay_sum": 0.0,
+            "r_queue_overflow_sum": 0.0,
+            "r_stops_sum": 0.0,
+            "r_fuel_sum": 0.0,
+            "r_smoothness_sum": 0.0,
+            "r_demand_robust_sum": 0.0,
+            "r_signal_compliance_sum": 0.0,
+            "r_green_pass_sum": 0.0,
         }
         self._controlled_veh_ids.clear()
         self._veh_type_max_speed.clear()
@@ -1249,7 +1305,10 @@ class CityVSLEnv(gym.Env):
                 avg_rate_per_s = 0.0
             avg_rate_vph = avg_rate_per_s * 3600.0
             ref_throughput_vph = self._get_ref_throughput_vph()
-            trend_norm = max(0.0, min(avg_rate_vph / float(max(ref_throughput_vph, 1e-6)), 1.0))
+            avg_norm = max(0.0, min(avg_rate_vph / float(max(ref_throughput_vph, 1e-6)), 1.0))
+            inst_norm = max(0.0, min((inst_rate_per_s * 3600.0) / float(max(ref_throughput_vph, 1e-6)), 1.0))
+            w = float(max(0.0, min(self._trend_inst_fallback_w, 1.0)))
+            trend_norm = max(0.0, min(((1.0 - w) * avg_norm + w * inst_norm), 1.0))
             self.metrics["arrival_rate_vph_ma"] = avg_rate_vph
             self.metrics["demand_trend_norm"] = trend_norm
             self.metrics["ref_throughput_vph"] = ref_throughput_vph
@@ -1275,8 +1334,13 @@ class CityVSLEnv(gym.Env):
             except Exception:
                 ref_vph_eb = float(ref_throughput_vph)
                 ref_vph_wb = float(ref_throughput_vph)
-            trend_norm_eb = max(0.0, min(avg_rate_vph_eb / float(max(ref_vph_eb, 1e-6)), 1.0))
-            trend_norm_wb = max(0.0, min(avg_rate_vph_wb / float(max(ref_vph_wb, 1e-6)), 1.0))
+            avg_norm_eb = max(0.0, min(avg_rate_vph_eb / float(max(ref_vph_eb, 1e-6)), 1.0))
+            avg_norm_wb = max(0.0, min(avg_rate_vph_wb / float(max(ref_vph_wb, 1e-6)), 1.0))
+            inst_norm_eb = max(0.0, min((inst_rate_per_s_eb * 3600.0) / float(max(ref_vph_eb, 1e-6)), 1.0))
+            inst_norm_wb = max(0.0, min((inst_rate_per_s_wb * 3600.0) / float(max(ref_vph_wb, 1e-6)), 1.0))
+            wdir = float(max(0.0, min(self._trend_inst_fallback_w, 1.0)))
+            trend_norm_eb = max(0.0, min(((1.0 - wdir) * avg_norm_eb + wdir * inst_norm_eb), 1.0))
+            trend_norm_wb = max(0.0, min(((1.0 - wdir) * avg_norm_wb + wdir * inst_norm_wb), 1.0))
             self.metrics["arrival_rate_vph_ma_eb"] = avg_rate_vph_eb
             self.metrics["arrival_rate_vph_ma_wb"] = avg_rate_vph_wb
             self.metrics["demand_trend_norm_eb"] = trend_norm_eb
@@ -1409,6 +1473,8 @@ class CityVSLEnv(gym.Env):
             "reward_weights": {
                 k: float(v) for k, v in (self.rw or {}).items()
             },
+            # 当前决策周期各方向/分段的信号窗口标志
+            "signal_window_flags": self._step_cache.get("signal_window_flags", {"eb": {}, "wb": {}}),
         }
 
         return obs, ep_reward, terminated, truncated, info
@@ -1443,7 +1509,7 @@ class CityVSLEnv(gym.Env):
         lf_steps = int(self.metrics.get("local_factor_steps", 0) or 0)
         lf_mean = (lf_sum / float(max(lf_steps, 1))) if lf_steps > 0 else 0.0
 
-        return {
+        out = {
             "avg_queue_veh": avg_queue,
             "throughput_veh_per_hour": throughput,
             "arrived_total": arrived,
@@ -1472,6 +1538,18 @@ class CityVSLEnv(gym.Env):
             # 参考吞吐量（veh/h）
             "ref_throughput_vph": float(self.metrics.get("ref_throughput_vph", 0.0) or 0.0),
         }
+
+        # 奖励分量episode均值
+        r_steps = int(self.metrics.get("reward_component_steps", 0) or 0)
+        for k in [
+            "r_efficiency","r_throughput","r_coordination","r_congestion","r_delay","r_queue_overflow",
+            "r_stops","r_fuel","r_smoothness","r_demand_robust","r_signal_compliance","r_green_pass"
+        ]:
+            s = float(self.metrics.get(f"{k}_sum", 0.0) or 0.0)
+            out[f"{k}_avg"] = (s / float(max(r_steps, 1))) if r_steps > 0 else 0.0
+        out["reward_component_steps"] = r_steps
+
+        return out
 
     # --------------------------------------------------------
     def _collect_lane_group_metrics(self, need_occ: bool = True) -> None:
@@ -1794,6 +1872,19 @@ class CityVSLEnv(gym.Env):
             feats.append(delta)
             self._prev_segment_speeds_norm.setdefault("wb", {})[gname] = curr
 
+        # 8) 方向化变幅因子（红/绿切换导致的临时收紧/放宽，归一到[0,1]；1≈常规、>1≈放宽、<1≈收紧）
+        try:
+            lf_eb_vals = list(self.last_local_factor.get("eb", {}).values())
+            lf_wb_vals = list(self.last_local_factor.get("wb", {}).values())
+            lf_eb = float(np.mean(lf_eb_vals)) if lf_eb_vals else 1.0
+            lf_wb = float(np.mean(lf_wb_vals)) if lf_wb_vals else 1.0
+        except Exception:
+            lf_eb, lf_wb = 1.0, 1.0
+        # 经验范围约在 [0.5, 2.0]，保守归一到 [0,1]
+        lf_eb_norm = max(0.0, min(lf_eb / 2.0, 1.0))
+        lf_wb_norm = max(0.0, min(lf_wb / 2.0, 1.0))
+        feats.extend([lf_eb_norm, lf_wb_norm])
+
         return np.array(feats, dtype=np.float32)
 
     # --------------------------------------------------------
@@ -2040,6 +2131,16 @@ class CityVSLEnv(gym.Env):
                 self.metrics["stops_steps"] += 1
                 self.metrics["smooth_sum_norm"] += float(smooth_pen)
                 self.metrics["smooth_steps"] += 1
+                # 奖励分量累计与步数计数（episode均值）
+                try:
+                    self.metrics["reward_component_steps"] = int(self.metrics.get("reward_component_steps", 0) or 0) + 1
+                    for k in [
+                        "r_efficiency","r_throughput","r_coordination","r_congestion","r_delay","r_queue_overflow",
+                        "r_stops","r_fuel","r_smoothness","r_demand_robust","r_signal_compliance","r_green_pass"
+                    ]:
+                        self.metrics[f"{k}_sum"] = float(self.metrics.get(f"{k}_sum", 0.0) or 0.0) + float(self.metrics.get(k, 0.0) or 0.0)
+                except Exception:
+                    pass
             except Exception:
                 pass
 

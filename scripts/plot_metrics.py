@@ -38,6 +38,24 @@ def plot_run(df: pd.DataFrame, run_dir: str) -> None:
         "avg_delay_norm",
         "avg_stops_norm",
         "avg_speed_fluct_norm",
+        # 新增诊断列
+        "coupling_clamp_events",
+        "local_factor_mean",
+        "td_error_mean",
+        "actor_loss",
+        # 奖励分量 episode 均值
+        "r_efficiency_avg",
+        "r_throughput_avg",
+        "r_coordination_avg",
+        "r_congestion_avg",
+        "r_delay_avg",
+        "r_queue_overflow_avg",
+        "r_stops_avg",
+        "r_fuel_avg",
+        "r_smoothness_avg",
+        "r_demand_robust_avg",
+        "r_signal_compliance_avg",
+        "r_green_pass_avg",
     ])
 
     ep = df["ep"].values if "ep" in df.columns else list(range(len(df)))
@@ -49,6 +67,25 @@ def plot_run(df: pd.DataFrame, run_dir: str) -> None:
         ("avg_delay_norm", "Avg Delay (norm)"),
         ("avg_stops_norm", "Avg Stops (norm)"),
         ("avg_speed_fluct_norm", "Avg Speed Fluct. (norm)"),
+        # 新增：耦合事件计数与局部因子均值
+        ("coupling_clamp_events", "Coupling Clamp Events"),
+        ("local_factor_mean", "Local Factor Mean"),
+        # 新增：训练侧诊断
+        ("td_error_mean", "TD Error Mean"),
+        ("actor_loss", "Actor Loss"),
+        # 新增：奖励分量均值（用于定位失衡分量）
+        ("r_efficiency_avg", "r_efficiency_avg"),
+        ("r_throughput_avg", "r_throughput_avg"),
+        ("r_coordination_avg", "r_coordination_avg"),
+        ("r_congestion_avg", "r_congestion_avg"),
+        ("r_delay_avg", "r_delay_avg"),
+        ("r_queue_overflow_avg", "r_queue_overflow_avg"),
+        ("r_stops_avg", "r_stops_avg"),
+        ("r_fuel_avg", "r_fuel_avg"),
+        ("r_smoothness_avg", "r_smoothness_avg"),
+        ("r_demand_robust_avg", "r_demand_robust_avg"),
+        ("r_signal_compliance_avg", "r_signal_compliance_avg"),
+        ("r_green_pass_avg", "r_green_pass_avg"),
     ]
 
     for col, title in figs:
@@ -82,6 +119,8 @@ def summarize_runs(run_dirs: List[str], out_dir: str) -> None:
             "avg_delay_norm",
             "avg_stops_norm",
             "avg_speed_fluct_norm",
+            "td_error_mean",
+            "actor_loss",
         ])
         try:
             rows.append({
@@ -93,6 +132,8 @@ def summarize_runs(run_dirs: List[str], out_dir: str) -> None:
                 "delay_mean": float(df["avg_delay_norm"].mean()),
                 "stops_mean": float(df["avg_stops_norm"].mean()),
                 "smooth_mean": float(df["avg_speed_fluct_norm"].mean()),
+                "td_error_mean": float(df["td_error_mean"].mean()),
+                "actor_loss_mean": float(df["actor_loss"].mean()),
             })
         except Exception as e:
             print(f"[warn] summarize {rd} failed: {e}")

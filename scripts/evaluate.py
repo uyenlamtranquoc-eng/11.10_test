@@ -18,9 +18,6 @@ from utils.seed_utils import set_seed as _common_set_seed
 from utils.config_utils import load_yaml_bom_safe, validate_env_config
 from utils.route_utils import (
     get_route_files_value,
-    strip_pen_suffix,
-    generate_penetrated_routes_from_base,
-    ensure_route_penetration,
 )
 
 
@@ -112,10 +109,12 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="评估设备：auto/cuda/cpu，默认auto")
     parser.add_argument("--repeat", type=int, default=1, help="重复评估次数（不同随机种子）")
     parser.add_argument("--seed_base", type=int, default=0, help="随机种子起点")
+    parser.add_argument("--config", type=str, default=None, help="配置文件路径（默认config/env.yaml）")
     args = parser.parse_args()
 
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    cfg = load_yaml_bom_safe(os.path.join(root, "config", "env.yaml"))
+    cfg_path = args.config if args.config else os.path.join(root, "config", "env.yaml")
+    cfg = load_yaml_bom_safe(cfg_path)
     # 配置合法性检查（硬约束 + 建议）
     try:
         validate_env_config(cfg, root)
@@ -137,7 +136,8 @@ def main():
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
     print(f"[device] 评估使用设备: {device}")
-    # 在进行路由准备之前设置随机种子，保证渗透路由的生成可重现
+    print(f"[config] 使用配置: {os.path.relpath(cfg_path, root)}")
+    # 在检查路由文件前设置随机种子，保证评估过程可重现
     try:
         set_seed(int(args.seed_base))
     except Exception:
@@ -148,49 +148,26 @@ def main():
     sumo_cfg_rel = cfg.get("sumo_cfg_relpath", "sumo/grid1x3.sumocfg")
     sumo_cfg_path = os.path.join(root, sumo_cfg_rel)
 
-    # 路由准备：确保 .rou.penXX.xml 存在且非空
+    # 路由文件检查：严格要求配置指向的 .rou 文件已存在且非空
     try:
         route_rel = get_route_files_value(sumo_cfg_path)
         sumo_dir = os.path.dirname(sumo_cfg_path)
         route_path = os.path.join(sumo_dir, route_rel)
-        base_rel = strip_pen_suffix(route_rel)
-        base_path = os.path.join(sumo_dir, base_rel)
-        pen_rate = float(cfg.get("penetration", 0.0))
-
-        need_gen = False
         if not os.path.exists(route_path):
-            need_gen = True
-        else:
-            try:
-                size = os.path.getsize(route_path)
-                need_gen = size < 100
-            except Exception:
-                need_gen = True
-
-        if need_gen:
-            print(f"[routes] regenerating penetrated routes for evaluation: {os.path.basename(base_path)} -> {os.path.basename(route_path)} | CAV rate={pen_rate}")
-            generate_penetrated_routes_from_base(base_path, route_path, pen_rate, cfg)
-            try:
-                ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-            except Exception as _e:
-                print(f"[routes] penetration check failed: {_e}")
-        else:
-            print(f"[routes] using existing route file: {route_rel}")
-            # 即使文件存在也进行渗透率一致性检查，若不匹配则重建
-            try:
-                ok = ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-            except Exception as _e:
-                print(f"[routes] penetration check failed: {_e}")
-                ok = False
-            if not ok:
-                print(f"[routes] mismatch detected; regenerating routes to target penetration={pen_rate}")
-                generate_penetrated_routes_from_base(base_path, route_path, pen_rate, cfg)
-                try:
-                    ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-                except Exception as _e:
-                    print(f"[routes] penetration check failed after regeneration: {_e}")
+            raise SystemExit(
+                f"[routes] 路由文件不存在: {route_rel} | 请先用 scripts/generate_structured_routes.py 生成并在 sumo 配置中指向该文件"
+            )
+        try:
+            size = os.path.getsize(route_path)
+        except Exception:
+            size = 0
+        if size < 100:
+            raise SystemExit(
+                f"[routes] 路由文件内容异常(可能为空): {route_rel} | 请用 scripts/generate_structured_routes.py 重新生成"
+            )
+        print(f"[routes] using route file for evaluation: {route_rel}")
     except Exception as e:
-        print(f"[routes] route preparation skipped due to error: {e}")
+        raise SystemExit(f"[routes] 路由文件检查失败：{e}")
 
     lane_groups = cfg.get(
         "lane_groups",
@@ -295,6 +272,8 @@ def main():
                 target_entropy_scale=float(cfg.get("sac_target_entropy_scale", 1.0)),
                 use_joint_action_constraint=bool(cfg.get("use_joint_action_constraint", True)),
                 actor_use_layer_norm=bool(cfg.get("actor_use_layer_norm", True)),
+                actor_context_samples=int(cfg.get("actor_context_samples", 1)),
+                target_context_samples=int(cfg.get("target_context_samples", 1)),
             )
             ckpt_path = args.ckpt if args.ckpt else _find_latest_sac_checkpoint(root)
             ckpt_path = os.path.join(root, ckpt_path) if not os.path.isabs(ckpt_path) else ckpt_path

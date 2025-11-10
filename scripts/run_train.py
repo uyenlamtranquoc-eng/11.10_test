@@ -20,9 +20,6 @@ from utils.seed_utils import set_seed as _common_set_seed
 from utils.config_utils import load_yaml_bom_safe, validate_env_config
 from utils.route_utils import (
     get_route_files_value,
-    strip_pen_suffix,
-    generate_penetrated_routes_from_base,
-    ensure_route_penetration,
 )
 
 
@@ -81,52 +78,26 @@ def main():
     sumo_cfg_rel = cfg.get("sumo_cfg_relpath", "sumo/grid1x3.sumocfg")
     # 如果想做多渗透率，可以在 cfg 里写多个 cfg，再根据 route_suffix 切
     sumo_cfg_path = os.path.join(root, sumo_cfg_rel)
-    # 基础版：不在训练脚本内修改路由文件或渗透率，直接使用配置中的 sumocfg
-    # 但若 sumocfg 指向的 .rou.penXX.xml 不存在或为空，则根据 base .rou 生成渗透版本
-
+    # 使用固定的路由文件，不再在训练时按渗透率生成或重建。
     try:
         route_rel = get_route_files_value(sumo_cfg_path)
         sumo_dir = os.path.dirname(sumo_cfg_path)
         route_path = os.path.join(sumo_dir, route_rel)
-        base_rel = strip_pen_suffix(route_rel)
-        base_path = os.path.join(sumo_dir, base_rel)
-
-        pen_rate = float(cfg.get("penetration", 0.0))
-        need_gen = False
         if not os.path.exists(route_path):
-            need_gen = True
-        else:
-            try:
-                size = os.path.getsize(route_path)
-                # 简单空文件判定：小于100字节（例如仅XML头）
-                need_gen = size < 100
-            except Exception:
-                need_gen = True
-
-        if need_gen:
-            print(f"[routes] regenerating penetrated routes: {os.path.basename(base_path)} -> {os.path.basename(route_path)} | CAV rate={pen_rate}")
-            generate_penetrated_routes_from_base(base_path, route_path, pen_rate, cfg)
-            try:
-                ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-            except Exception as _e:
-                print(f"[routes] penetration check failed: {_e}")
-        else:
-            print(f"[routes] using existing route file: {route_rel}")
-            # 即使文件存在也进行渗透率一致性检查，若不匹配则重建
-            try:
-                ok = ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-            except Exception as _e:
-                print(f"[routes] penetration check failed: {_e}")
-                ok = False
-            if not ok:
-                print(f"[routes] mismatch detected; regenerating routes to target penetration={pen_rate}")
-                generate_penetrated_routes_from_base(base_path, route_path, pen_rate, cfg)
-                try:
-                    ensure_route_penetration(route_path, pen_rate, cav_type_id=str(cfg.get("cav_type_id", "CAV")))
-                except Exception as _e:
-                    print(f"[routes] penetration check failed after regeneration: {_e}")
+            raise SystemExit(
+                f"[routes] 路由文件不存在: {route_rel} | 请先用 scripts/generate_structured_routes.py 生成并在 sumo 配置中指向该文件"
+            )
+        try:
+            size = os.path.getsize(route_path)
+        except Exception:
+            size = 0
+        if size < 100:
+            raise SystemExit(
+                f"[routes] 路由文件内容异常(可能为空): {route_rel} | 请用 scripts/generate_structured_routes.py 重新生成"
+            )
+        print(f"[routes] using route file: {route_rel}")
     except Exception as e:
-        print(f"[routes] route preparation skipped due to error: {e}")
+        raise SystemExit(f"[routes] 路由文件检查失败：{e}")
 
     lane_groups = cfg.get(
         "lane_groups",
@@ -215,6 +186,8 @@ def main():
         target_entropy_scale=float(cfg.get("sac_target_entropy_scale", 1.0)),
         use_joint_action_constraint=bool(cfg.get("use_joint_action_constraint", True)),
         actor_use_layer_norm=bool(cfg.get("actor_use_layer_norm", True)),
+        actor_context_samples=int(cfg.get("actor_context_samples", 1)),
+        target_context_samples=int(cfg.get("target_context_samples", 1)),
     )
     print(f"[SAC] 使用 Polyak 软更新，tau={float(cfg.get('sac_tau', 0.005)):.4f}")
 
@@ -283,7 +256,15 @@ def main():
     metrics_csv = os.path.join(metrics_dir, "train_metrics.csv")
     if not os.path.exists(metrics_csv):
         with open(metrics_csv, "w", encoding="utf-8") as f:
-            f.write("ep,algo,tau,reward,avg20,alpha,avg_queue_veh,throughput_veh_per_hour,arrived_total,sim_seconds,avg_delay_norm,avg_stops_norm,avg_speed_fluct_norm,gate_mean_eb,gate_mean_wb\n")
+            f.write(
+                "ep,algo,tau,reward,avg20,alpha,"
+                "avg_queue_veh,throughput_veh_per_hour,arrived_total,sim_seconds,"
+                "avg_delay_norm,avg_stops_norm,avg_speed_fluct_norm,"
+                "gate_mean_eb,gate_mean_wb,coupling_clamp_events,local_factor_mean,"
+                "r_efficiency_avg,r_throughput_avg,r_coordination_avg,r_congestion_avg,r_delay_avg,r_queue_overflow_avg,"
+                "r_stops_avg,r_fuel_avg,r_smoothness_avg,r_demand_robust_avg,r_signal_compliance_avg,r_green_pass_avg,"
+                "td_error_mean,actor_loss\n"
+            )
     best_avg20 = -1e18
     best_ckpt = None
 
@@ -362,7 +343,13 @@ def main():
             pass
         with open(metrics_csv, "a", encoding="utf-8") as f:
             f.write(
-                f"{ep},sac,{float(cfg.get('sac_tau', 0.0) or 0.0):.6f},{ep_reward:.6f},{avg20:.6f},{alpha_val:.6f},{m.get('avg_queue_veh',0.0):.6f},{m.get('throughput_veh_per_hour',0.0):.6f},{int(m.get('arrived_total',0) or 0):d},{float(m.get('sim_seconds',0.0) or 0.0):.6f},{m.get('avg_delay_norm',0.0):.6f},{m.get('avg_stops_norm',0.0):.6f},{m.get('avg_speed_fluct_norm',0.0):.6f},{g_eb:.6f},{g_wb:.6f}\n"
+                f"{ep},sac,{float(cfg.get('sac_tau', 0.0) or 0.0):.6f},{ep_reward:.6f},{avg20:.6f},{alpha_val:.6f},"
+                f"{m.get('avg_queue_veh',0.0):.6f},{m.get('throughput_veh_per_hour',0.0):.6f},{int(m.get('arrived_total',0) or 0):d},{float(m.get('sim_seconds',0.0) or 0.0):.6f},"
+                f"{m.get('avg_delay_norm',0.0):.6f},{m.get('avg_stops_norm',0.0):.6f},{m.get('avg_speed_fluct_norm',0.0):.6f},"
+                f"{g_eb:.6f},{g_wb:.6f},{int(m.get('coupling_clamp_events',0) or 0):d},{m.get('local_factor_mean',0.0):.6f},"
+                f"{m.get('r_efficiency_avg',0.0):.6f},{m.get('r_throughput_avg',0.0):.6f},{m.get('r_coordination_avg',0.0):.6f},{m.get('r_congestion_avg',0.0):.6f},{m.get('r_delay_avg',0.0):.6f},{m.get('r_queue_overflow_avg',0.0):.6f},"
+                f"{m.get('r_stops_avg',0.0):.6f},{m.get('r_fuel_avg',0.0):.6f},{m.get('r_smoothness_avg',0.0):.6f},{m.get('r_demand_robust_avg',0.0):.6f},{m.get('r_signal_compliance_avg',0.0):.6f},{m.get('r_green_pass_avg',0.0):.6f},"
+                f"{float(getattr(agent,'metrics',{}).get('td_error_mean',0.0)):.6f},{float(getattr(agent,'metrics',{}).get('actor_loss',0.0)):.6f}\n"
             )
 
         # 基础版：不保存环境绑定的完整检查点，统一使用智能体检查点

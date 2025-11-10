@@ -163,6 +163,8 @@ class MultiHeadSACAgent:
         target_entropy_scale: float = 1.0,
         use_joint_action_constraint: bool = False,
         actor_use_layer_norm: bool = False,
+        actor_context_samples: int = 1,
+        target_context_samples: int = 1,
     ) -> None:
         self.device = torch.device(device)
         self.obs_dim = int(obs_dim)
@@ -177,6 +179,9 @@ class MultiHeadSACAgent:
         self.target_entropy_scale = float(target_entropy_scale)
         self._train_steps = 0
         self.max_grad_norm = max_grad_norm
+        # 多样本上下文采样数（降低 Monte Carlo 方差）
+        self.actor_ctx_K = max(1, int(actor_context_samples))
+        self.target_ctx_K = max(1, int(target_context_samples))
 
         # 网络
         self.policy = MultiHeadPolicy(
@@ -293,31 +298,29 @@ class MultiHeadSACAgent:
 
         B = states.shape[0]
 
-        # ---------- 1) 计算每头的目标值（为每个候选动作重建一致上下文） ----------
+        # ---------- 1) 计算每头的目标值（对 a_-i 进行 K 次上下文采样并平均，降低方差） ----------
         with torch.no_grad():
             next_logits = self.policy(next_states)
             next_logp_list = [F.log_softmax(l, dim=-1) for l in next_logits]
             next_pi_list = [torch.exp(lp) for lp in next_logp_list]
-            # 其他头的联合上下文基底：一次采样，用于固定 a_-i
-            next_ctx_base = torch.stack([torch.distributions.Categorical(logits=l).sample() for l in next_logits], dim=1)  # [B,H]
-            # alpha（每头）
             alpha_heads = (
                 self.log_alpha_vec.detach().exp() if (self.auto_alpha and self.log_alpha_vec is not None) else torch.full((self.num_heads,), self.alpha, device=self.device)
             )
-            v_next_heads: List[torch.Tensor] = []  # list of [B]
-            for i in range(self.num_heads):
-                # 对每个候选 a_i，构造一致的联合上下文 action_ctx（替换第 i 头的动作为该候选）
-                v_i = torch.zeros(B, device=self.device)
-                for ai in range(self.nvec[i]):
-                    ctx_i = next_ctx_base.clone()
-                    ctx_i[:, i] = int(ai)
-                    # 在该上下文下前向，取第 i 头的该候选动作 Q 值
-                    q1_i_vec = self.q1_target(next_states, action_ctx=ctx_i)[i]
-                    q2_i_vec = self.q2_target(next_states, action_ctx=ctx_i)[i]
-                    min_q_ai = torch.minimum(q1_i_vec[:, ai], q2_i_vec[:, ai])  # [B]
-                    v_i = v_i + next_pi_list[i][:, ai] * (min_q_ai - alpha_heads[i] * next_logp_list[i][:, ai])
-                v_next_heads.append(v_i)
-            # 每头的 TD 目标，拼成 [B, H]
+            v_next_heads_accum: List[torch.Tensor] = [torch.zeros(B, device=self.device) for _ in range(self.num_heads)]
+            for _k in range(self.target_ctx_K):
+                # 其他头的联合上下文基底：一次采样，用于固定 a_-i
+                next_ctx_base = torch.stack([torch.distributions.Categorical(logits=l).sample() for l in next_logits], dim=1)  # [B,H]
+                for i in range(self.num_heads):
+                    v_i = torch.zeros(B, device=self.device)
+                    for ai in range(self.nvec[i]):
+                        ctx_i = next_ctx_base.clone()
+                        ctx_i[:, i] = int(ai)
+                        q1_i_vec = self.q1_target(next_states, action_ctx=ctx_i)[i]
+                        q2_i_vec = self.q2_target(next_states, action_ctx=ctx_i)[i]
+                        min_q_ai = torch.minimum(q1_i_vec[:, ai], q2_i_vec[:, ai])  # [B]
+                        v_i = v_i + next_pi_list[i][:, ai] * (min_q_ai - alpha_heads[i] * next_logp_list[i][:, ai])
+                    v_next_heads_accum[i] = v_next_heads_accum[i] + v_i
+            v_next_heads = [v / float(self.target_ctx_K) for v in v_next_heads_accum]
             target_q_per_head = torch.stack([
                 rewards + (1.0 - dones) * self.gamma * v_next_heads[i]
                 for i in range(self.num_heads)
@@ -327,9 +330,7 @@ class MultiHeadSACAgent:
         # Q 前向时传入当前联合动作作为上下文
         q1_values_list = self.q1(states, action_ctx=actions)
         q2_values_list = self.q2(states, action_ctx=actions)
-        # 为后续 actor 步骤复用，提前保存无梯度版本，避免重复前向
-        q1_values_list_for_actor = [v.detach() for v in q1_values_list]
-        q2_values_list_for_actor = [v.detach() for v in q2_values_list]
+        # 注：actor 步骤需在不同上下文下评估候选动作的 Q；当前 q1/q2 前向不可直接复用
 
         # gather 当前动作的 Q 值，得到 [B, H]
         q1_a = []
@@ -346,6 +347,11 @@ class MultiHeadSACAgent:
         # 每样本 TD 误差（头维平均），用于内部监控（不返回给外部）
         td_errors_per_head = torch.abs(target_q_per_head - torch.minimum(q1_a, q2_a))  # [B, H]
         td_error_mean = td_errors_per_head.mean().item()
+        # 记录诊断指标（供训练脚本写入CSV）
+        try:
+            self.metrics['td_error_mean'] = float(td_error_mean)
+        except Exception:
+            pass
 
         # MSE 损失（也可替换为 Huber）；计算每样本、每头的误差并聚合
         q1_td = q1_a - target_q_per_head  # [B, H]
@@ -370,30 +376,38 @@ class MultiHeadSACAgent:
         logp_list = [F.log_softmax(l, dim=-1) for l in logits_list]
         pi_list = [torch.exp(lp) for lp in logp_list]
 
-        # 为 actor 期望构造一次联合上下文采样（作为 a_-i 基底），并为每个候选 a_i 重建上下文
-        curr_ctx_base = torch.stack([torch.distributions.Categorical(logits=l).sample() for l in logits_list], dim=1)
-
         alpha_heads_actor = (
             self.log_alpha_vec.detach().exp() if (self.auto_alpha and self.log_alpha_vec is not None) else torch.full((self.num_heads,), self.alpha, device=self.device)
         )
         actor_loss_terms: List[torch.Tensor] = []
         for i in range(self.num_heads):
-            # 计算在一致上下文下，第 i 头对所有候选动作的 minQ_i(a_i, a_-i)
-            min_q_per_action: List[torch.Tensor] = []
-            for ai in range(self.nvec[i]):
-                ctx_i = curr_ctx_base.clone()
-                ctx_i[:, i] = int(ai)
-                q1_i_vec = self.q1(states, action_ctx=ctx_i)[i].detach()
-                q2_i_vec = self.q2(states, action_ctx=ctx_i)[i].detach()
-                min_q_ai = torch.minimum(q1_i_vec[:, ai], q2_i_vec[:, ai])  # [B]
-                min_q_per_action.append(min_q_ai)
-            # [B, n_i]
-            min_q_tensor = torch.stack(min_q_per_action, dim=1)
+            # 在 K 次不同联合上下文下，估计第 i 头候选动作的 minQ_i(a_i, a_-i) 的期望
+            min_q_accum = torch.zeros(B, self.nvec[i], device=self.device)
+            for _k in range(self.actor_ctx_K):
+                # 为 actor 期望构造一次联合上下文采样（作为 a_-i 基底），并为每个候选 a_i 重建上下文
+                curr_ctx_base = torch.stack([torch.distributions.Categorical(logits=l).sample() for l in logits_list], dim=1)
+                with torch.no_grad():
+                    min_q_per_action: List[torch.Tensor] = []
+                    for ai in range(self.nvec[i]):
+                        ctx_i = curr_ctx_base.clone()
+                        ctx_i[:, i] = int(ai)
+                        q1_i_vec = self.q1(states, action_ctx=ctx_i)[i]
+                        q2_i_vec = self.q2(states, action_ctx=ctx_i)[i]
+                        min_q_ai = torch.minimum(q1_i_vec[:, ai], q2_i_vec[:, ai])  # [B]
+                        min_q_per_action.append(min_q_ai)
+                    min_q_tensor_k = torch.stack(min_q_per_action, dim=1)  # [B, n_i]
+                min_q_accum = min_q_accum + min_q_tensor_k
+            min_q_tensor = min_q_accum / float(self.actor_ctx_K)
             # E_{a_i~pi_i}[ alpha*logpi_i - minQ_i ]
             term_i = (pi_list[i] * (alpha_heads_actor[i] * logp_list[i] - min_q_tensor)).sum(dim=-1).mean()
             actor_loss_terms.append(term_i)
         # 将各头损失取平均，避免随头数线性放大（使用stack.mean确保返回Tensor）
         actor_loss = torch.stack(actor_loss_terms).mean()
+        # 记录actor损失（标量），便于外部CSV日志采集
+        try:
+            self.metrics['actor_loss'] = float(actor_loss.detach().item())
+        except Exception:
+            pass
 
         self.policy_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
