@@ -432,6 +432,9 @@ class MultiHeadSACAgent:
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_optimizer.step()
+            # 安全夹紧 log_alpha，避免温度系数失控（约束 alpha ∈ [0.01, 0.7]）
+            with torch.no_grad():
+                self.log_alpha_vec.data.clamp_(min=-4.6052, max=-0.3567)
 
         # 记录指标：损失、温度、TD 误差统计、每头平均熵
         head_entropies = [

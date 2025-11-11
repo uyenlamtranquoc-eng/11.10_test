@@ -1,0 +1,8 @@
+Loading net-file from 'C:\Users\33093\Desktop\限速控制算法进展\11.9xs\sumo/grid1x3.net.xml' ... done (2ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\限速控制算法进展\11.9xs\sumo/grid1x3.pen30.rou.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.23'; waited too long (yield), lane='E_J2_1', time=1015.00.
+Warning: Vehicle 'flow_east_straight_hdv.23' ends teleporting on edge 'J2_J1', time=1041.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.25'; waited too long (yield), lane='E_J2_1', time=1550.00.
+Warning: Vehicle 'flow_east_straight_hdv.25' ends teleporting on edge 'J2_J1', time=1550.00.

@@ -1,0 +1,25 @@
+Loading net-file from 'C:\Users\33093\Desktop\限速控制算法进展\11.9xs\sumo/grid1x3.net.xml' ... done (1ms).
+Loading route-files incrementally from 'C:\Users\33093\Desktop\限速控制算法进展\11.9xs\sumo/grid1x3.pen30.rou.xml'
+Loading done.
+Simulation version 1.24.0 started via libsumo with time: 0.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.25'; waited too long (yield), lane='E_J2_1', time=1525.00.
+Warning: Vehicle 'flow_east_straight_hdv.25' ends teleporting on edge 'J2_J1', time=1550.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.26'; waited too long (yield), lane='E_J2_1', time=2085.00.
+Warning: Vehicle 'flow_east_straight_hdv.26' ends teleporting on edge 'J2_J1', time=2092.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.27'; waited too long (yield), lane='E_J2_1', time=2389.00.
+Warning: Vehicle 'flow_east_straight_hdv.27' ends teleporting on edge 'J2_J1', time=2417.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.29'; waited too long (yield), lane='E_J2_1', time=2752.00.
+Warning: Vehicle 'flow_east_straight_hdv.29' ends teleporting on edge 'J2_J1', time=2785.00.
+Warning: Teleporting vehicle 'flow_east_straight_hdv.30'; waited too long (yield), lane='E_J2_1', time=3057.00.
+Warning: Vehicle 'flow_east_straight_hdv.30' ends teleporting on edge 'J2_J1', time=3057.00.
+Simulation ended at time: 3609.00.
+Reason: Libsumo requested termination.
+Performance:
+ Duration: 23.63s
+ Real time factor: 152.736
+ UPS: 28759.236531
+Vehicles:
+ Inserted: 3263 (Loaded: 3612)
+ Running: 229
+ Waiting: 349
+ Teleports: 5 (Yield: 5)

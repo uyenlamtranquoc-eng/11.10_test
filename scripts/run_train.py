@@ -146,6 +146,9 @@ def main():
         reward_coordination_weight=float(cfg.get("reward_coordination_weight", 0.5)),
         reward_throughput_weight=float(cfg.get("reward_throughput_weight", 0.3)),
         reward_demand_robust_weight=float(cfg.get("reward_demand_robust_weight", 0.3)),
+        # 新增：信号遵从与绿窗通过奖励权重（保持向后兼容）
+        reward_signal_compliance_weight=float(cfg.get("reward_signal_compliance_weight", 0.2)),
+        reward_green_pass_weight=float(cfg.get("reward_green_pass_weight", 0.3)),
         reward_change_penalty=float(cfg.get("reward_change_penalty", 0.1)),
         reward_queue_overflow_threshold=float(cfg.get("reward_queue_overflow_threshold", 0.8)),
         reward_delay_max_ratio_extra=float(cfg.get("reward_delay_max_ratio_extra", 3.0)),

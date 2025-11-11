@@ -55,6 +55,9 @@ class CityVSLEnv(gym.Env):
         reward_throughput_weight: float = 0.3,
         reward_demand_robust_weight: float = 0.3,
         reward_change_penalty: float = 0.1,
+        # 新增：可配置的信号遵从与绿窗通过权重（保持向后兼容）
+        reward_signal_compliance_weight: float = 0.2,
+        reward_green_pass_weight: float = 0.3,
         warmup_steps: int = 5,
         reward_clip_min: Optional[float] = None,
         reward_clip_max: Optional[float] = None,
@@ -141,9 +144,9 @@ class CityVSLEnv(gym.Env):
             "throughput": float(reward_throughput_weight),
             "demand_robust": float(reward_demand_robust_weight),
             "action_change": float(reward_change_penalty),
-            # 新增：信号遵从惩罚与绿窗通过奖励（默认权重，可根据需要调整）
-            "signal_compliance": 0.2,
-            "green_pass": 0.3,
+            # 新增：信号遵从惩罚与绿窗通过奖励（可配置，默认与之前一致）
+            "signal_compliance": float(reward_signal_compliance_weight),
+            "green_pass": float(reward_green_pass_weight),
         }
 
         self._reward_clip_min = reward_clip_min
@@ -170,9 +173,27 @@ class CityVSLEnv(gym.Env):
             "eb": {k: 1.0 for k in self.group_keys},
             "wb": {k: 1.0 for k in self.group_keys},
         }
+
+        # 新增：方向化局部因子缩放与速度波动尺度（从 norm_cfg 读取，提供默认值）
+        _norm = norm_cfg or {}
+        self.local_factor_dir_scale: Dict[str, float] = {
+            "eb": float(_norm.get("local_factor_dir_scale_eb", 1.0)),
+            "wb": float(_norm.get("local_factor_dir_scale_wb", 1.0)),
+        }
+        # smoothness_penalty_scale 用于放大速度波动归一指标（不改变原始测量），仅影响奖励与日志
+        self.smoothness_penalty_scale: float = float(_norm.get("smoothness_penalty_scale", 1.0))
         self._fuel_hist: deque = deque(maxlen=int(max(3, round(600.0 / float(max(self.decision_interval, 1))))))
         # 提前初始化归一策略配置，避免在首次使用前引用为空
         self.norm_cfg = norm_cfg or {}
+        # 新增：近绿窗窗口、黄灯容差、耦合钳制事件去抖与冷却、绿窗通过占有率权重幂
+        self.near_green_window_seconds: float = float(self.norm_cfg.get("near_green_window_seconds", 2.0 * float(self.decision_interval)))
+        self.yellow_phase_tolerance_seconds: float = float(self.norm_cfg.get("yellow_phase_tolerance_seconds", 2.0))
+        self.clamp_event_debounce_steps: int = int(self.norm_cfg.get("coupling_clamp_debounce_steps", 1))
+        self.clamp_event_cooldown_steps: int = int(self.norm_cfg.get("coupling_clamp_cooldown_steps", 3))
+        self.green_pass_occ_weight_pow: float = float(self.norm_cfg.get("green_pass_occ_weight_pow", 1.0))
+        # 钳制事件状态：分段方向去抖累计与冷却计数
+        self._clamp_event_pending: Dict[Tuple[str, str], int] = {}
+        self._clamp_event_cooldowns: Dict[Tuple[str, str], int] = {}
         # 需求趋势：最近数步到达流率（veh/s）的滑动窗口（快与慢两个时间尺度，可配置）
         _trend_fast_sec = float(self.norm_cfg.get("arrival_trend_window_seconds_fast", 60.0))
         _trend_slow_sec = float(self.norm_cfg.get("arrival_trend_window_seconds_slow", 300.0))
@@ -526,7 +547,10 @@ class CityVSLEnv(gym.Env):
                                 state = getattr(p, "state", "") if hasattr(p, "state") else str(p)
                             except Exception:
                                 state = ""
-                            isg = ('G' in state) or ('g' in state)
+                            # 仅将主绿（'G'）视为对应相位的“绿窗”，避免任何相位都含有次绿('g')导致绿窗始终为真
+                            # 说明：SUMO相位字符串中，'G' 表示主绿放行，'g' 常表示次级/许可绿；
+                            # 这里采用保守策略，仅以 'G' 判定绿窗，避免协调奖励退化为常数。
+                            isg = ('G' in state)
                             greens.append(isg)
                             if isg:
                                 green_phases.add(idx)
@@ -594,20 +618,61 @@ class CityVSLEnv(gym.Env):
     def _build_segment_tls_map(self) -> None:
         """建立每段对应的下游信号映射。
 
-        简化策略：按段索引 0/1/2 分别映射到 tls_ids[1], tls_ids[2], tls_ids[-1]（尾段复用最后一个信号）。
-        若信号数量不足，则使用最后一个信号兜底。东/西向共享同序映射。
+        修正为方向化与地理序一致的映射：
+        - 东向（EB）：上游→tls_ids[0]，中游→tls_ids[1]，下游→tls_ids[last]
+        - 西向（WB）：上游→tls_ids[last]，中游→tls_ids[last-1]，下游→tls_ids[0]
+        若信号数量不足则使用边界索引兜底。
         """
         ids = list(self.tls_ids or [])
         if not ids:
             return
         last_idx = len(ids) - 1
         for i, g in enumerate(self.group_keys):
-            tls_idx = min(i + 1, last_idx)
-            tls_id = ids[tls_idx]
-            self.segment_tls_map.setdefault("eb", {})[g] = tls_id
-            self.segment_tls_map.setdefault("wb", {})[g] = tls_id
+            # EB 按自然顺序映射
+            tls_id_eb = ids[min(i, last_idx)]
+            # WB 反向映射（走廊方向相反）
+            tls_id_wb = ids[max(last_idx - i, 0)]
+            self.segment_tls_map.setdefault("eb", {})[g] = tls_id_eb
+            self.segment_tls_map.setdefault("wb", {})[g] = tls_id_wb
 
     # --------------------------------------------------------
+    def _tick_coupling_cooldowns(self) -> None:
+        """每个决策步调用一次：钳制事件的冷却计数器递减。"""
+        try:
+            for k in list(self._clamp_event_cooldowns.keys()):
+                v = int(self._clamp_event_cooldowns.get(k, 0) or 0)
+                if v > 0:
+                    self._clamp_event_cooldowns[k] = v - 1
+                else:
+                    # 清零后删除，避免膨胀
+                    self._clamp_event_cooldowns.pop(k, None)
+        except Exception:
+            pass
+
+    def _register_coupling_clamp_attempt(self, direction: str, segment: str) -> None:
+        """记录一次钳制尝试，应用去抖与冷却：
+
+        - 在冷却期内不计事件（pending 清零）。
+        - 连续≥ debounce_steps 次尝试后计 1 次事件，并进入冷却期。
+        """
+        try:
+            key = (str(direction), str(segment))
+            cool = int(self._clamp_event_cooldowns.get(key, 0) or 0)
+            if cool > 0:
+                # 冷却期：不累计，不计事件
+                self._clamp_event_pending[key] = 0
+                return
+            cnt = int(self._clamp_event_pending.get(key, 0) or 0) + 1
+            self._clamp_event_pending[key] = cnt
+            if cnt >= int(self.clamp_event_debounce_steps):
+                # 计一次事件并启动冷却
+                self.metrics["coupling_clamp_events"] = int(self.metrics.get("coupling_clamp_events", 0) or 0) + 1
+                self._clamp_event_pending[key] = 0
+                self._clamp_event_cooldowns[key] = int(self.clamp_event_cooldown_steps)
+        except Exception:
+            # 安全失败：若状态异常，不影响主流程
+            pass
+
     def _apply_signal_speed_coupling(self, target_speeds: Tuple[float, ...]) -> Tuple[float, ...]:
         """在车辆施加前，依据信号绿窗、排队与需求，对每段目标速度进行耦合约束。"""
         # 确保有最新的分段指标（含占有率）
@@ -631,11 +696,30 @@ class CityVSLEnv(gym.Env):
         base_delta = float(self.max_delta_kph) / 3.6
         # 全局需求作为兜底
         demand_global = float(self.metrics.get("demand_trend_norm", 0.0))
-        slow_mps = 12.0
+        # 动态慢速阈值：取动作空间下限与参考速度比例的更大者
+        try:
+            slow_candidates = []
+            if self.speed_levels_mps:
+                slow_candidates.append(float(min(self.speed_levels_mps)))
+            slow_candidates.append(0.4 * float(self.max_ref_speed_mps))
+            slow_mps = float(max(slow_candidates)) if slow_candidates else 12.0
+        except Exception:
+            slow_mps = 12.0
         occ_thr = 0.30
         h_thr = float(self.queue_overflow_threshold)
 
         for direction, offset in (("eb", 0), ("wb", 3)):
+            # 计算下游拥堵信号用于级联抑制（溢出/占有率）
+            try:
+                down_vals = lm.get(direction, {}).get("down", {})
+                avg_halts_down = float(down_vals.get("halts", 0.0))
+                upper_halts_down = self._get_halts_upper_for_segment(direction, "down")
+                halts_norm_down = max(0.0, min(avg_halts_down / float(max(upper_halts_down, 1e-6)), 1.0))
+                occ_down = float(down_vals.get("occ", 0.0))
+                down_congested = bool((halts_norm_down > h_thr) or (occ_down > occ_thr))
+            except Exception:
+                down_congested = False
+
             for seg_idx, seg in enumerate(self.group_keys):
                 i = offset + seg_idx
                 tls_id = self.segment_tls_map.get(direction, {}).get(seg)
@@ -667,7 +751,7 @@ class CityVSLEnv(gym.Env):
 
                 # 记录信号窗口标志（is_green_now/near_green/start_sec/dur_sec/remain_curr）
                 try:
-                    near_green = bool(start_sec <= (2.0 * float(self.decision_interval)))
+                    near_green = bool(start_sec <= float(self.near_green_window_seconds))
                     signal_flags.setdefault(direction, {})[seg] = {
                         "is_green_now": bool(is_now_green),
                         "near_green": bool(near_green),
@@ -689,10 +773,11 @@ class CityVSLEnv(gym.Env):
                 if is_green_now < 1.0:
                     demand_dir = float(self.metrics.get("demand_trend_norm_eb" if direction == "eb" else "demand_trend_norm_wb", demand_global))
                     slow_cap = slow_mps * (1.0 - 0.25 * min(max(demand_dir, 0.0), 1.0))
-                    near_green = (start_sec <= (2.0 * float(self.decision_interval)))
+                    near_green = (start_sec <= float(self.near_green_window_seconds))
                     before_ts = ts[i]
                     if near_green:
-                        alpha = max(0.0, min(1.0 - (start_sec / (2.0 * float(self.decision_interval))), 1.0))
+                        denom = float(max(self.near_green_window_seconds, 1e-6))
+                        alpha = max(0.0, min(1.0 - (start_sec / denom), 1.0))
                         cap = slow_cap + alpha * (self.max_ref_speed_mps - slow_cap)
                         ts[i] = min(ts[i], cap)
                     else:
@@ -700,7 +785,8 @@ class CityVSLEnv(gym.Env):
                     # 记录一次“耦合限制”事件（若降低了目标速度）
                     try:
                         if ts[i] < before_ts - 1e-9:
-                            self.metrics["coupling_clamp_events"] = int(self.metrics.get("coupling_clamp_events", 0) or 0) + 1
+                            self._register_coupling_clamp_attempt(direction, seg)
+                        
                     except Exception:
                         pass
 
@@ -711,10 +797,16 @@ class CityVSLEnv(gym.Env):
                     local_delta = base_delta * 0.5
                     diff = float(ts[i] - prev[i])
                     ts[i] = prev[i] + np.sign(diff) * min(abs(diff), local_delta)
+                    # 拥挤/占有率过阈：同时收紧本段变幅系数
+                    try:
+                        # 在后续统一应用前，先标记需要收紧
+                        signal_flags.setdefault(direction, {}).setdefault(seg, {})["_lf_reduce_due_to_congestion"] = True
+                    except Exception:
+                        pass
                     # 记录一次“耦合限制”事件（若降低了目标速度）
                     try:
                         if ts[i] < before_ts - 1e-9:
-                            self.metrics["coupling_clamp_events"] = int(self.metrics.get("coupling_clamp_events", 0) or 0) + 1
+                            self._register_coupling_clamp_attempt(direction, seg)
                     except Exception:
                         pass
                 # 面向诊断的拥挤/占有率附加标志
@@ -722,6 +814,27 @@ class CityVSLEnv(gym.Env):
                     sf = signal_flags.setdefault(direction, {}).setdefault(seg, {})
                     sf["halts_norm"] = float(halts_norm)
                     sf["occ"] = float(occ)
+                except Exception:
+                    pass
+
+                # 级联抑制：若下游拥堵，收紧上游与中游的目标速度与变幅
+                local_factor = 1.0
+                if down_congested and seg != "down":
+                    before_ts_cascade = ts[i]
+                    ts[i] = min(ts[i], max(prev[i], slow_mps))
+                    # 记录一次“耦合限制”事件（若降低了目标速度）
+                    try:
+                        if ts[i] < before_ts_cascade - 1e-9:
+                            self._register_coupling_clamp_attempt(direction, seg)
+                    except Exception:
+                        pass
+                    # 同时收紧变幅系数
+                    local_factor *= 0.5
+
+                # 若本段出现拥挤/占有率超阈，适度收紧变幅系数（诊断标记由上方溢出抑制处置逻辑设置）
+                try:
+                    if signal_flags.get(direction, {}).get(seg, {}).get("_lf_reduce_due_to_congestion", False):
+                        local_factor *= 0.7
                 except Exception:
                     pass
 
@@ -750,31 +863,42 @@ class CityVSLEnv(gym.Env):
                             # 记录一次“耦合限制”事件（若降低了目标速度）
                             try:
                                 if ts[i] < before_ts - 1e-9:
-                                    self.metrics["coupling_clamp_events"] = int(self.metrics.get("coupling_clamp_events", 0) or 0) + 1
+                                    self._register_coupling_clamp_attempt(direction, seg)
                             except Exception:
                                 pass
 
                 # 信号切换下的变幅协同
                 prev_green = bool(self._prev_tls_green_state.get(tls_id, False))
-                local_factor = 1.0
+                # 若前面因级联收紧已调整 local_factor，则在此基础上再叠加切换策略
+                # 默认 local_factor=1.0（已在上方初始化/可能被下游拥堵收紧）
                 if (not prev_green) and is_now_green:
                     # 红→绿：临时放宽变幅以尽快恢复
-                    local_factor = 2.0
+                    local_factor = max(local_factor, 2.0)
                 elif prev_green and (not is_now_green) and (remain_curr <= float(self.decision_interval)):
                     # 绿→红且剩余很短：收紧变幅，避免突升
-                    local_factor = 0.5
+                    local_factor = min(local_factor, 0.5)
 
+                # 临近绿窗（红灯阶段且下一绿窗即将到来）：轻微放宽变幅以提前平滑过渡
+                try:
+                    if signal_flags.get(direction, {}).get(seg, {}).get("near_green", False) and (is_green_now < 1.0):
+                        local_factor = max(local_factor, 1.25)
+                except Exception:
+                    pass
+
+                # 应用方向化局部因子缩放
+                dir_scale = float(self.local_factor_dir_scale.get(direction, 1.0))
+                local_factor_applied = float(local_factor * dir_scale)
                 diff = float(ts[i] - prev[i])
-                ts[i] = prev[i] + np.sign(diff) * min(abs(diff), base_delta * local_factor)
+                ts[i] = prev[i] + np.sign(diff) * min(abs(diff), base_delta * local_factor_applied)
                 # 累计记录局部因子（用于 episode 级均值评估）
                 try:
-                    self.metrics["local_factor_sum"] = float(self.metrics.get("local_factor_sum", 0.0) or 0.0) + float(local_factor)
+                    self.metrics["local_factor_sum"] = float(self.metrics.get("local_factor_sum", 0.0) or 0.0) + float(local_factor_applied)
                     self.metrics["local_factor_steps"] = int(self.metrics.get("local_factor_steps", 0) or 0) + 1
                 except Exception:
                     pass
                 # 记录最近一次方向/分段的局部因子以供观测
                 try:
-                    self.last_local_factor.setdefault(direction, {})[seg] = float(local_factor)
+                    self.last_local_factor.setdefault(direction, {})[seg] = float(local_factor_applied)
                 except Exception:
                     pass
                 self._prev_tls_green_state[tls_id] = bool(is_now_green == 1.0)
@@ -1038,6 +1162,15 @@ class CityVSLEnv(gym.Env):
         }
         self._controlled_veh_ids.clear()
         self._veh_type_max_speed.clear()
+        # 清空钳制事件去抖与冷却状态
+        try:
+            self._clamp_event_pending.clear()
+        except Exception:
+            self._clamp_event_pending = {}
+        try:
+            self._clamp_event_cooldowns.clear()
+        except Exception:
+            self._clamp_event_cooldowns = {}
 
         # 暖机步数：推进仿真但不计入指标
         for _ in range(self.warmup_steps):
@@ -1062,6 +1195,12 @@ class CityVSLEnv(gym.Env):
         2. 内存泄漏防护和性能监控
         3. 动作历史记录（有限长度）
         """
+        # 0. 决策步开始：更新钳制事件冷却计数器（每决策步一次）
+        try:
+            self._tick_coupling_cooldowns()
+        except Exception:
+            pass
+
         # 1. MultiDiscrete 动作解析与越界保护：期望长度为 6 的整数向量
         try:
             indices = np.array(action, dtype=np.int64).reshape(-1)
@@ -1968,8 +2107,14 @@ class CityVSLEnv(gym.Env):
                 occ_vals = occ_vals
             congestion_pen = float(np.mean(occ_vals)) if occ_vals else 0.0
 
-            # 3) 队列溢出惩罚（超阈值部分）
-            queue_overflow = float(np.mean([max(h - self.queue_overflow_threshold, 0.0) for h in halts_norms])) if halts_norms else 0.0
+            # 3) 队列溢出惩罚归一化：将“超阈值部分”按 (1 - 阈值) 缩放到 [0,1]
+            if halts_norms:
+                _excess = [max(h - self.queue_overflow_threshold, 0.0) for h in halts_norms]
+                _raw_overflow = float(np.mean(_excess))
+                _denom = float(max(1.0 - self.queue_overflow_threshold, 1e-6))
+                queue_overflow = max(0.0, min(_raw_overflow / _denom, 1.0))
+            else:
+                queue_overflow = 0.0
 
             # 4) 停车惩罚（基于 halts_norm）
             stops_pen = halting_norm
@@ -2014,8 +2159,9 @@ class CityVSLEnv(gym.Env):
                 # 代理：以怠速（halts）与速度波动联合近似
                 fuel_norm = max(0.0, min(0.6 * halting_norm + 0.4 * (float(np.mean(smooth_deltas)) if smooth_deltas else 0.0), 1.0))
 
-            # 7) 速度平滑惩罚（平均速度差）
-            smooth_pen = float(np.mean(smooth_deltas)) if smooth_deltas else 0.0
+            # 7) 速度平滑惩罚（平均速度差），可按尺度放大用于提高可分辨性
+            _smooth_raw = float(np.mean(smooth_deltas)) if smooth_deltas else 0.0
+            smooth_pen = max(0.0, min(_smooth_raw * float(self.smoothness_penalty_scale), 1.0))
 
             # 8) 绿波/协调奖励（信号就绪度）
             coord_vals: List[float] = []
@@ -2029,10 +2175,41 @@ class CityVSLEnv(gym.Env):
                 coord_vals.append(max(0.0, min(ready, 1.0)))
             coordination = float(np.mean(coord_vals)) if coord_vals else 0.0
 
-            # 8.1) 信号遵从惩罚与绿窗通过激励
-            safe_mps_red = 12.0
+            # 8.1) 信号遵从惩罚与绿窗通过激励（改用CAV子集速度，动态红灯安全阈值）
+            try:
+                safe_candidates = []
+                if self.speed_levels_mps:
+                    safe_candidates.append(float(min(self.speed_levels_mps)))
+                safe_candidates.append(0.5 * float(self.max_ref_speed_mps))
+                safe_mps_red = float(max(safe_candidates)) if safe_candidates else 12.0
+            except Exception:
+                safe_mps_red = 12.0
             signal_pen_vals: List[float] = []
-            green_pass_vals: List[float] = []
+            green_pass_items: List[tuple] = []  # 每项为 (score, weight)
+
+            def _avg_cav_speed_on_lanes(lane_ids: List[str]) -> Optional[float]:
+                if not lane_ids:
+                    return None
+                speeds: List[float] = []
+                seen = set()
+                for lid in lane_ids:
+                    try:
+                        vids = traci.lane.getLastStepVehicleIDs(lid)
+                    except Exception:
+                        vids = []
+                    for vid in vids:
+                        if vid in seen:
+                            continue
+                        seen.add(vid)
+                        try:
+                            if str(traci.vehicle.getTypeID(vid)) == str(self.cav_type_id):
+                                speeds.append(float(traci.vehicle.getSpeed(vid)))
+                        except Exception:
+                            pass
+                if speeds:
+                    return float(np.mean(speeds))
+                return None
+
             for direction in ("eb", "wb"):
                 for g in self.group_keys:
                     tls_id = self.segment_tls_map.get(direction, {}).get(g)
@@ -2040,21 +2217,26 @@ class CityVSLEnv(gym.Env):
                         continue
                     vals = lm.get(direction, {}).get(g, {})
                     v_mps = float(vals.get("speed", 0.0))
+                    # 车道集合，用于CAV速度与长度估计
+                    lane_ids = (self.lane_groups if direction == "eb" else self.wb_lane_groups).get(g, [])
+                    v_cav = _avg_cav_speed_on_lanes(lane_ids)
+                    v_used = float(v_cav) if v_cav is not None else float(v_mps)
                     try:
                         is_green_now, start_norm, dur_norm = self._get_tls_green_window_features(tls_id)
                     except Exception:
                         is_green_now, start_norm, dur_norm = (0.0, 1.0, 0.0)
-                    # 红灯期间仍高速的惩罚（相对参考速度归一）
-                    if is_green_now < 1.0 and v_mps > safe_mps_red:
-                        signal_pen_vals.append(max(0.0, min((v_mps - safe_mps_red) / float(max(self.max_ref_speed_mps, 1e-6)), 1.0)))
-                    # 绿窗通过奖励：预测到达时间位于即将到来的绿窗内
                     meta = self._tls_cycle_meta.get(tls_id, {})
                     cycle_len = float(meta.get("cycle_len", 60.0))
                     start_sec = float(start_norm) * cycle_len
                     dur_sec = float(dur_norm) * cycle_len
+                    # 红灯期间仍高速的惩罚（相对参考速度归一，黄灯容差豁免）
+                    if is_green_now < 1.0:
+                        in_yellow_tolerance = bool(start_sec <= float(self.yellow_phase_tolerance_seconds))
+                        if (not in_yellow_tolerance) and v_used > safe_mps_red:
+                            signal_pen_vals.append(max(0.0, min((v_used - safe_mps_red) / float(max(self.max_ref_speed_mps, 1e-6)), 1.0)))
+                    # 绿窗通过奖励：预测到达时间位于（当前/下一）绿窗附近，使用三角核软匹配；按占有率加权
                     # 段平均长度与预计通过时间
                     L = 0.0
-                    lane_ids = (self.lane_groups if direction == "eb" else self.wb_lane_groups).get(g, [])
                     if lane_ids:
                         lens: List[float] = []
                         for lid in lane_ids:
@@ -2065,13 +2247,26 @@ class CityVSLEnv(gym.Env):
                             except Exception:
                                 pass
                         L = float(np.mean(lens)) if lens else 0.0
-                    if L > 0.0 and v_mps > 0.1:
-                        eta = L / float(max(v_mps, 1e-3))
-                        arrive_in_window = (eta >= start_sec) and (eta <= (start_sec + dur_sec))
-                        green_pass_vals.append(1.0 if arrive_in_window else 0.0)
+                    if L > 0.0 and v_used > 0.1 and dur_sec > 0.0:
+                        eta = L / float(max(v_used, 1e-3))
+                        # 使用三角核：以绿窗中心为峰，半宽取 max(dur/2, decision_interval)
+                        half = max(dur_sec * 0.5, float(self.decision_interval))
+                        center = start_sec + 0.5 * dur_sec
+                        score = 1.0 - (abs(eta - center) / float(max(half, 1e-6)))
+                        score = max(0.0, min(score, 1.0))
+                        occ = float(vals.get("occ", 0.0))
+                        w = float(max(occ, 0.0)) ** float(self.green_pass_occ_weight_pow)
+                        green_pass_items.append((score, w))
 
             signal_compliance_pen = float(np.mean(signal_pen_vals)) if signal_pen_vals else 0.0
-            green_pass_reward = float(np.mean(green_pass_vals)) if green_pass_vals else 0.0
+            if green_pass_items:
+                total_w = float(sum(w for _, w in green_pass_items))
+                if total_w > 1e-9:
+                    green_pass_reward = float(sum(s * w for s, w in green_pass_items)) / total_w
+                else:
+                    green_pass_reward = float(np.mean([s for s, _ in green_pass_items]))
+            else:
+                green_pass_reward = 0.0
 
             # 9) 吞吐奖励（使用已计算的趋势归一）
             throughput = float(self.metrics.get("demand_trend_norm", 0.0))
